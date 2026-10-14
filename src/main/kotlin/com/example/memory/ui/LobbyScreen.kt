@@ -59,8 +59,8 @@ fun LobbyScreen(
                         color = MaterialTheme.colorScheme.onBackground,
                     )
                     Text(
-                        "Вы: ${net.myNick}",
-                        fontSize = 14.sp,
+                        "Вы: ${net.myNick}  ·  ${net.myAddress}",
+                        fontSize = 13.sp,
                         color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.6f),
                     )
                 }

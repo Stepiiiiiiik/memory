@@ -11,10 +11,16 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import java.net.DatagramSocket
+import java.net.InetAddress
 import java.net.InetSocketAddress
+import java.net.NetworkInterface
 import java.net.ServerSocket
 import java.net.Socket
 import java.util.UUID
+
+/** Preferred TCP port range so it can be opened in a firewall. */
+private val TCP_PORTS = 45780..45799
 
 enum class NetStatus { BROWSING, INVITING, INCOMING }
 
@@ -28,6 +34,10 @@ enum class NetStatus { BROWSING, INVITING, INCOMING }
 class NetworkManager(private val scope: CoroutineScope) {
 
     var myNick by mutableStateOf("")
+        private set
+
+    /** This client's own listening address, shown in the lobby for diagnostics. */
+    var myAddress by mutableStateOf("")
         private set
 
     val peers = mutableStateListOf<PeerInfo>()
@@ -57,6 +67,7 @@ class NetworkManager(private val scope: CoroutineScope) {
 
     private val myId: String = UUID.randomUUID().toString()
     private var tcpPort: Int = 0
+    private var localIps: Set<String> = emptySet()
     private var serverSocket: ServerSocket? = null
     private var discovery: Discovery? = null
     private val jobs = mutableListOf<Job>()
@@ -81,11 +92,11 @@ class NetworkManager(private val scope: CoroutineScope) {
         peers.clear()
         notice = null
 
-        val server = ServerSocket()
-        server.reuseAddress = true
-        server.bind(InetSocketAddress(0))
+        localIps = collectLocalIps()
+        val server = bindServer()
         serverSocket = server
         tcpPort = server.localPort
+        myAddress = "${primaryIp()}:$tcpPort"
 
         jobs += scope.launch(Dispatchers.IO) {
             while (isActive) {
@@ -131,6 +142,43 @@ class NetworkManager(private val scope: CoroutineScope) {
         invitingTo = null
     }
 
+    private fun bindServer(): ServerSocket {
+        for (p in TCP_PORTS) {
+            try {
+                return ServerSocket().apply {
+                    reuseAddress = true
+                    bind(InetSocketAddress(p))
+                }
+            } catch (_: Exception) {
+                // Port busy (e.g. a second window on this machine); try the next.
+            }
+        }
+        // Fall back to any free port.
+        return ServerSocket().apply {
+            reuseAddress = true
+            bind(InetSocketAddress(0))
+        }
+    }
+
+    private fun collectLocalIps(): Set<String> = try {
+        NetworkInterface.getNetworkInterfaces().asSequence()
+            .flatMap { it.inetAddresses.asSequence() }
+            .mapNotNull { it.hostAddress?.substringBefore('%') }
+            .toSet()
+    } catch (_: Exception) {
+        emptySet()
+    }
+
+    /** Best-effort primary outbound IPv4 for display. */
+    private fun primaryIp(): String = try {
+        DatagramSocket().use {
+            it.connect(InetAddress.getByName("8.8.8.8"), 53)
+            it.localAddress?.hostAddress?.substringBefore('%') ?: "127.0.0.1"
+        }
+    } catch (_: Exception) {
+        localIps.firstOrNull { it.contains('.') && it != "127.0.0.1" } ?: "127.0.0.1"
+    }
+
     private fun upsertPeer(id: String, nick: String, host: String, port: Int) {
         val now = System.currentTimeMillis()
         val i = peers.indexOfFirst { it.id == id }
@@ -146,11 +194,22 @@ class NetworkManager(private val scope: CoroutineScope) {
         invitingTo = peer.nick
         notice = null
 
+        // If the peer is on this same machine, reach it via loopback — this
+        // avoids host-firewall rules that filter traffic to our own LAN IP
+        // (and makes two-window testing on one computer reliable).
+        val targetHost = if (peer.host in localIps) "127.0.0.1" else peer.host
+
         scope.launch(Dispatchers.IO) {
             val socket = try {
-                Socket().apply { connect(InetSocketAddress(peer.host, peer.port), 4000) }
-            } catch (_: Exception) {
-                main { resetToBrowsing("Не удалось связаться с игроком") }
+                Socket().apply { connect(InetSocketAddress(targetHost, peer.port), 4000) }
+            } catch (e: Exception) {
+                val reason = e.message ?: "нет соединения"
+                main {
+                    resetToBrowsing(
+                        "Не удалось связаться с ${peer.nick} ($targetHost:${peer.port}): $reason. " +
+                            "Проверьте, что порт открыт в файрволе.",
+                    )
+                }
                 return@launch
             }
             val conn = GameConnection(socket)
